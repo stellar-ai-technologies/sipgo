@@ -50,6 +50,53 @@ func TestDialogServerByeRequest(t *testing.T) {
 	assert.Equal(t, "<sip:P3:5060>", routes[2].Value())
 }
 
+func TestDialogServerByeConnectionFlowAffinity(t *testing.T) {
+	// RFC 5923: in-dialog requests over a reliable transport should be pinned
+	// to the dialog's established connection (the INVITE source address).
+	newDialogBye := func(t *testing.T, transport string, setSource bool) *sip.Request {
+		ua, _ := NewUA()
+		defer ua.Close()
+		cli, _ := NewClient(ua)
+
+		uasContact := sip.ContactHeader{
+			Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+		}
+		dialogSrv := NewDialogServerCache(cli, uasContact)
+
+		invite, _, _ := createTestInvite(t, "sip:uas@uas.com", transport, "uas.com:5090")
+		invite.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: "uas", Port: 1234}})
+		invite.AppendHeader(&sip.RecordRouteHeader{Address: sip.Uri{Host: "P1", Port: 5060}})
+		if setSource {
+			invite.SetSource("10.0.0.5:5061")
+		}
+
+		dialog, err := dialogSrv.ReadInvite(invite, sip.NewServerTx("test", invite, nil, slog.Default()))
+		require.NoError(t, err)
+
+		bye := sip.NewRequest(sip.BYE, invite.Contact().Address)
+		ctxCanceled, cancel := context.WithCancel(context.Background())
+		cancel()
+		// No execution
+		dialog.TransactionRequest(ctxCanceled, bye)
+		return bye
+	}
+
+	t.Run("TLS", func(t *testing.T) {
+		bye := newDialogBye(t, "tls", true)
+		require.Equal(t, "10.0.0.5:5061", bye.ConnectionFlowAddr())
+	})
+
+	t.Run("TCP", func(t *testing.T) {
+		bye := newDialogBye(t, "tcp", true)
+		require.Equal(t, "10.0.0.5:5061", bye.ConnectionFlowAddr())
+	})
+
+	t.Run("UDP", func(t *testing.T) {
+		bye := newDialogBye(t, "udp", true)
+		require.Equal(t, "", bye.ConnectionFlowAddr())
+	})
+}
+
 func TestDialogServerTransactionCanceled(t *testing.T) {
 	// sip.Timer_H = 0
 

@@ -430,12 +430,23 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 	laddr := req.Laddr
 	req.raddr = raddr
 
-	// This is probably client forcing host:port
-	if laddr.IP != nil && laddr.Port > 0 {
-		c = transport.GetConnection(laddr.String())
-	} else if l.connectionReuse {
-		addr := raddr.String()
-		c = transport.GetConnection(addr)
+	// RFC 5923: in-dialog requests over a reliable transport reuse the
+	// connection established for the dialog. That connection is pooled under
+	// the peer (source) address, not the Route derived destination, so try it
+	// first. If it is gone we fall through to normal destination based
+	// selection and a fresh dial.
+	if req.connFlowAddr != "" && IsReliable(network) {
+		c = transport.GetConnection(req.connFlowAddr)
+	}
+
+	if c == nil {
+		// This is probably client forcing host:port
+		if laddr.IP != nil && laddr.Port > 0 {
+			c = transport.GetConnection(laddr.String())
+		} else if l.connectionReuse {
+			addr := raddr.String()
+			c = transport.GetConnection(addr)
+		}
 	}
 
 	if c == nil {

@@ -18,7 +18,23 @@ type Request struct {
 	Laddr Addr
 	// raddr is address set after resolving Via
 	raddr Addr
+
+	// connFlowAddr, when set, pins this request to an already established
+	// connection identified by the peer (remote) address it is pooled under.
+	// Used for in-dialog requests over reliable transports so they reuse the
+	// dialog's existing connection instead of dialing the Route hop (RFC 5923).
+	connFlowAddr string
 }
+
+// SetConnectionFlowAddr pins the request to a pooled connection identified by
+// addr (the remote/source address the connection is keyed under). For reliable
+// transports the transport layer reuses that connection before resolving a new
+// destination, per RFC 5923. It falls back to normal destination based
+// selection if that connection is gone.
+func (req *Request) SetConnectionFlowAddr(addr string) { req.connFlowAddr = addr }
+
+// ConnectionFlowAddr returns the pinned connection flow address, if any.
+func (req *Request) ConnectionFlowAddr() string { return req.connFlowAddr }
 
 // NewRequest creates base for building sip Request
 // A Request-Line contains a method name, a Request-URI, and the SIP/2.0 as version
@@ -348,6 +364,7 @@ func cloneRequest(req *Request) *Request {
 	newReq.SetDestination(req.Destination())
 	newReq.raddr = req.raddr
 	newReq.Laddr = req.Laddr
+	newReq.connFlowAddr = req.connFlowAddr
 
 	return newReq
 }

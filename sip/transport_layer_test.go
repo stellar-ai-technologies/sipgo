@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/fakes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -294,6 +296,70 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		testParallel(t, "TCP")
 	})
 
+}
+
+func TestTransportLayerClientConnectionFlowAffinity(t *testing.T) {
+	// RFC 5923: in-dialog requests over a reliable transport must reuse the
+	// connection established for the dialog, which is pooled under the peer
+	// (source) address rather than the Route derived destination.
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	defer func() {
+		require.NoError(t, tp.Close())
+	}()
+
+	// Simulate an inbound accepted connection pooled under the peer source addr.
+	const sourceKey = "10.0.0.5:5061"
+	pinnedConn := &TCPConnection{Conn: &fakes.TCPConn{
+		LAddr: net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
+		RAddr: net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 5061},
+	}}
+	tp.tcp.pool.Add(sourceKey, pinnedConn)
+	// Remove the fake from the pool so Close does not act on it.
+	defer tp.tcp.pool.Delete(sourceKey)
+
+	t.Run("ReusesPinnedConnection", func(t *testing.T) {
+		// Destination is the Route hop (TEST-NET-1, unroutable). A real dial
+		// would fail, so reaching the pinned connection proves no dial happened.
+		req := NewRequest(OPTIONS, Uri{Host: "192.0.2.1", Port: 5061})
+		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 0})
+		req.SetTransport("tcp")
+		req.SetConnectionFlowAddr(sourceKey)
+
+		conn, err := tp.ClientRequestConnection(context.TODO(), req)
+		require.NoError(t, err)
+		require.Same(t, pinnedConn, conn)
+	})
+
+	t.Run("FallsBackWhenConnectionGone", func(t *testing.T) {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer l.Close()
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					break
+				}
+				go func() { conn.Read([]byte{}) }()
+			}
+		}()
+
+		host, port, err := net.SplitHostPort(l.Addr().String())
+		require.NoError(t, err)
+		dport, err := strconv.Atoi(port)
+		require.NoError(t, err)
+
+		req := NewRequest(OPTIONS, Uri{Host: host, Port: dport})
+		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 0})
+		req.SetTransport("tcp")
+		// Flow addr that is not in the pool: must fall back to a fresh dial.
+		req.SetConnectionFlowAddr("10.0.0.99:5061")
+
+		conn, err := tp.ClientRequestConnection(context.TODO(), req)
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+		require.NotSame(t, pinnedConn, conn)
+	})
 }
 
 func TestTransportLayerClientConnectionNoReuse(t *testing.T) {

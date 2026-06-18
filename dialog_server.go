@@ -180,6 +180,13 @@ func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// TODO check is contact header routable
 	// If not then we should force destination as source address
 	req.SetTransport(s.InviteRequest.Transport())
+
+	// RFC 5923: reuse the dialog's established connection for in-dialog
+	// requests over a reliable transport. The connection is pooled under the
+	// INVITE source address; pin to it so we do not dial the Route hop.
+	if sip.IsReliable(sip.NetworkToLower(s.InviteRequest.Transport())) {
+		req.SetConnectionFlowAddr(s.InviteRequest.Source())
+	}
 }
 
 // Close is always good to call for cleanup or terminating dialog state
