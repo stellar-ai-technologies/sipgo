@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -164,6 +165,29 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 	s.lastCSeqNo.Store(cseq.SeqNo)
 	// Make sure transport matches original invite
 	req.SetTransport(s.InviteRequest.Transport())
+
+	// Reliable-transport in-dialog requests must reuse the dialog's established
+	// connection (RFC 5923) and, if it is gone, re-dial the remote target while
+	// still proving the original dialog hostname.
+	if sip.IsReliable(sip.NetworkToLower(s.InviteRequest.Transport())) {
+		// Layer 1: pin to the dialog connection. For a UAC the connection is
+		// pooled under the peer (remote) address, which is the source of the
+		// INVITE response, not the locally derived INVITE request source.
+		if s.InviteResponse != nil {
+			if src := s.InviteResponse.Source(); src != "" {
+				req.SetConnectionFlowAddr(src)
+			}
+		}
+
+		// Layer 2: if the connection has to be re-dialed, the remote target may
+		// be a bare IP, but the name proven against the peer certificate is the
+		// hostname originally dialed. Reuse it as the TLS ServerName. Derive it
+		// from the INVITE destination (honoring SetDestination/Route, unlike the
+		// Request-URI) and skip IP literals, which carry no usable SNI.
+		if host, _, err := sip.ParseAddr(s.InviteRequest.Destination()); err == nil && net.ParseIP(host) == nil {
+			req.SetConnectionTLSHostname(host)
+		}
+	}
 }
 
 // Close must be always called in order to cleanup some internal resources

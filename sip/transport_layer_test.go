@@ -3,7 +3,14 @@ package sip
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"math/big"
 	"net"
 	"strconv"
 	"sync"
@@ -360,6 +367,146 @@ func TestTransportLayerClientConnectionFlowAffinity(t *testing.T) {
 		require.NotNil(t, conn)
 		require.NotSame(t, pinnedConn, conn)
 	})
+}
+
+// selfSignedTLSCert returns a self-signed leaf (used as its own root) covering
+// the given DNS SANs and no IP SAN, plus a pool trusting it.
+func selfSignedTLSCert(t *testing.T, dnsNames ...string) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: dnsNames[0]},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              dnsNames,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv, Leaf: leaf}, roots
+}
+
+func TestTransportLayerClientTLSHostnameOverride(t *testing.T) {
+	// Reproduces the carrier teardown scenario: a TLS peer presents a
+	// hostname-only certificate (no IP SAN). An in-dialog request is routed to
+	// the peer Contact, a bare IP. Re-dialing that IP defaults SNI to the IP and
+	// fails verification; pinning the dialog hostname via connTLSHostname makes
+	// the handshake verify while still dialing the specific IP.
+	const sni = "carrier.example.com"
+
+	// Self-signed leaf with a DNS SAN and no IP SAN.
+	serverCert, roots := selfSignedTLSCert(t, sni)
+
+	// TLS server bound to a loopback IP, which the certificate does not cover.
+	ln, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{serverCert}})
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = conn.(*tls.Conn).Handshake() }()
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	dport, err := strconv.Atoi(port)
+	require.NoError(t, err)
+
+	newReq := func() *Request {
+		req := NewRequest(OPTIONS, Uri{Scheme: "sips", Host: host, Port: dport})
+		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 0})
+		req.SetTransport("tls")
+		return req
+	}
+
+	t.Run("WithoutHostnameFailsVerification", func(t *testing.T) {
+		tp := NewTransportLayer(net.DefaultResolver, NewParser(), &tls.Config{RootCAs: roots})
+		defer tp.Close()
+
+		_, err := tp.ClientRequestConnection(context.TODO(), newReq())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "certificate")
+	})
+
+	t.Run("WithHostnameVerifies", func(t *testing.T) {
+		tp := NewTransportLayer(net.DefaultResolver, NewParser(), &tls.Config{RootCAs: roots})
+		defer tp.Close()
+
+		req := newReq()
+		req.SetConnectionTLSHostname(sni)
+
+		conn, err := tp.ClientRequestConnection(context.TODO(), req)
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+
+		// The hostname override is SNI only: the connection is still pooled under
+		// the dialed IP, never under the hostname.
+		require.NotNil(t, tp.tls.pool.getUnref(net.JoinHostPort(host, port)))
+		require.Nil(t, tp.tls.pool.getUnref(net.JoinHostPort(sni, port)))
+	})
+}
+
+func TestTransportLayerClientTLSHostnameNotOverriddenForFQDN(t *testing.T) {
+	// Regression guard for the unconditional override: connTLSHostname must only
+	// substitute SNI when the in-dialog destination is a bare IP with no usable
+	// SNI of its own. When the destination is itself a hostname, resolveRemoteAddr
+	// already produced the correct ServerName, and clobbering it with the dialog
+	// hostname would break a legitimate re-dial to a different host whose
+	// certificate does not cover the dialog hostname.
+	const dialogHost = "carrier.example.com" // pinned, NOT on the server cert
+
+	// Cert covers only the destination hostname (localhost), not the dialog host.
+	serverCert, roots := selfSignedTLSCert(t, "localhost")
+
+	ln, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{serverCert}})
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = conn.(*tls.Conn).Handshake() }()
+		}
+	}()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	dport, err := strconv.Atoi(port)
+	require.NoError(t, err)
+
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), &tls.Config{RootCAs: roots})
+	defer tp.Close()
+
+	// Destination host is a hostname (localhost) resolving to the loopback
+	// listener; pin a different dialog hostname the cert does not cover.
+	req := NewRequest(OPTIONS, Uri{Scheme: "sips", Host: "localhost", Port: dport})
+	req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 0})
+	req.SetTransport("tls")
+	req.SetConnectionTLSHostname(dialogHost)
+
+	// The gate keeps SNI = localhost (the destination), so the handshake verifies.
+	// Without the gate SNI would be carrier.example.com and verification would fail.
+	conn, err := tp.ClientRequestConnection(context.TODO(), req)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// Pool is keyed by the dialed IP, never the pinned dialog hostname.
+	require.Nil(t, tp.tls.pool.getUnref(net.JoinHostPort(dialogHost, port)))
 }
 
 func TestTransportLayerClientConnectionNoReuse(t *testing.T) {

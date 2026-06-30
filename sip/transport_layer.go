@@ -409,6 +409,22 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 		return nil, err
 	}
 
+	// In-dialog requests are routed to the remote target, which may be a bare
+	// IP (e.g. a carrier Contact). resolveRemoteAddr derives the TLS ServerName
+	// from that destination, so a TLS re-dial would present the IP as SNI and
+	// fail certificate verification. When the request pins the original dialog
+	// hostname, restore it as the resolved hostname so the handshake verifies.
+	// The connection pool key is unaffected: Addr.String keys on the IP.
+	//
+	// Only override when the destination is an IP literal with no usable SNI of
+	// its own. If the destination is itself a hostname, resolveRemoteAddr already
+	// set the correct ServerName; clobbering it with the dialog hostname could
+	// break a legitimate re-dial to a different host that the dialog hostname's
+	// certificate does not cover.
+	if req.connTLSHostname != "" && net.ParseIP(dhost) != nil {
+		raddr.Hostname = req.connTLSHostname
+	}
+
 	// Now use Via header to determine our local address
 	// Here is from RFC statement:
 	//   Before a request is sent, the client transport MUST insert a value of

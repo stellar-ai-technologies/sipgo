@@ -120,6 +120,79 @@ func TestDialogClientRequestRecordRouteHeaders(t *testing.T) {
 
 }
 
+func TestDialogClientByeConnectionAffinity(t *testing.T) {
+	// RFC 5923: in-dialog UAC requests over a reliable transport must be pinned
+	// to the dialog's established connection (Layer 1, the INVITE *response*
+	// source, which is the remote address the connection is pooled under) and,
+	// when that connection is gone and a re-dial is needed, must present the
+	// originally dialed hostname as TLS SNI (Layer 2) so a carrier Contact that
+	// is a bare IP without an IP SAN still verifies.
+	buildDialogReq := func(t *testing.T, transport, target string, newReq func(inv *sip.Request, resp *sip.Response) *sip.Request) *sip.Request {
+		client := testClient(t, func(req *sip.Request) *sip.Response {
+			return sip.NewResponseFromRequest(req, 200, "OK", nil)
+		})
+
+		invite, _, _ := createTestInvite(t, target, transport, "10.0.0.5:5061")
+		resp := sip.NewResponseFromRequest(invite, 200, "OK", nil)
+		resp.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "service", Host: "54.172.60.2", Port: 5061}})
+		// The 200 OK was read off the dialog connection, so its source is the
+		// remote address that connection is pooled under.
+		resp.SetSource("54.172.60.2:5061")
+
+		s := DialogClientSession{
+			UA:     &DialogUA{Client: client},
+			Dialog: Dialog{InviteRequest: invite, InviteResponse: resp},
+		}
+		req := newReq(s.InviteRequest, s.InviteResponse)
+		s.buildReq(req)
+		return req
+	}
+
+	newBye := func(inv *sip.Request, resp *sip.Response) *sip.Request {
+		return newByeRequestUAC(inv, resp, nil)
+	}
+
+	t.Run("TLS_FQDN", func(t *testing.T) {
+		bye := buildDialogReq(t, "tls", "sips:service@customer.sip.twilio.com", newBye)
+		require.Equal(t, "54.172.60.2:5061", bye.ConnectionFlowAddr())
+		require.Equal(t, "customer.sip.twilio.com", bye.ConnectionTLSHostname())
+	})
+
+	t.Run("TLS_FQDN_ACK", func(t *testing.T) {
+		// ACK is also built through buildReq and must carry the same pins.
+		ack := buildDialogReq(t, "tls", "sips:service@customer.sip.twilio.com", func(inv *sip.Request, resp *sip.Response) *sip.Request {
+			return newAckRequestUAC(inv, resp, nil)
+		})
+		require.Equal(t, "54.172.60.2:5061", ack.ConnectionFlowAddr())
+		require.Equal(t, "customer.sip.twilio.com", ack.ConnectionTLSHostname())
+	})
+
+	t.Run("TCP_FQDN", func(t *testing.T) {
+		bye := buildDialogReq(t, "tcp", "sip:service@customer.sip.twilio.com", newBye)
+		require.Equal(t, "54.172.60.2:5061", bye.ConnectionFlowAddr())
+		// Harmless for TCP; CreateConnection ignores it.
+		require.Equal(t, "customer.sip.twilio.com", bye.ConnectionTLSHostname())
+	})
+
+	t.Run("UDP_NotReliable", func(t *testing.T) {
+		bye := buildDialogReq(t, "udp", "sip:service@customer.sip.twilio.com", newBye)
+		require.Equal(t, "", bye.ConnectionFlowAddr())
+		require.Equal(t, "", bye.ConnectionTLSHostname())
+	})
+
+	t.Run("TLS_IPLiteral_NoHostname", func(t *testing.T) {
+		// Dialog dialed an IP directly: no usable SNI, so do not pin a hostname.
+		bye := buildDialogReq(t, "tls", "sips:service@54.172.60.2", newBye)
+		require.Equal(t, "54.172.60.2:5061", bye.ConnectionFlowAddr())
+		require.Equal(t, "", bye.ConnectionTLSHostname())
+	})
+
+	t.Run("TLS_IPv6Literal_NoHostname", func(t *testing.T) {
+		bye := buildDialogReq(t, "tls", "sips:service@[2001:db8::1]", newBye)
+		require.Equal(t, "", bye.ConnectionTLSHostname())
+	})
+}
+
 func TestDialogClientMultiRequest(t *testing.T) {
 	var sentReq *sip.Request
 	client := testClient(t, func(req *sip.Request) *sip.Response {

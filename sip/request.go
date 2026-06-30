@@ -24,6 +24,14 @@ type Request struct {
 	// Used for in-dialog requests over reliable transports so they reuse the
 	// dialog's existing connection instead of dialing the Route hop (RFC 5923).
 	connFlowAddr string
+
+	// connTLSHostname, when set, overrides the TLS ServerName (SNI) used when a
+	// connection has to be (re)dialed for this request. In-dialog requests are
+	// routed to the remote target (a Contact that may be a bare IP), but the
+	// name proven against the peer certificate is the hostname originally
+	// dialed. Pinning it here lets the re-dial verify even though the
+	// destination is an IP without an IP SAN.
+	connTLSHostname string
 }
 
 // SetConnectionFlowAddr pins the request to a pooled connection identified by
@@ -35,6 +43,16 @@ func (req *Request) SetConnectionFlowAddr(addr string) { req.connFlowAddr = addr
 
 // ConnectionFlowAddr returns the pinned connection flow address, if any.
 func (req *Request) ConnectionFlowAddr() string { return req.connFlowAddr }
+
+// SetConnectionTLSHostname pins the TLS ServerName (SNI) used when a connection
+// is (re)dialed for this request. It is honored only for TLS based transports
+// and only when the dial TLS config does not already force a ServerName. Use it
+// for in-dialog requests whose destination is an IP but whose dialog was
+// established against a hostname, so the certificate still verifies.
+func (req *Request) SetConnectionTLSHostname(h string) { req.connTLSHostname = h }
+
+// ConnectionTLSHostname returns the pinned TLS ServerName, if any.
+func (req *Request) ConnectionTLSHostname() string { return req.connTLSHostname }
 
 // NewRequest creates base for building sip Request
 // A Request-Line contains a method name, a Request-URI, and the SIP/2.0 as version
@@ -365,6 +383,7 @@ func cloneRequest(req *Request) *Request {
 	newReq.raddr = req.raddr
 	newReq.Laddr = req.Laddr
 	newReq.connFlowAddr = req.connFlowAddr
+	newReq.connTLSHostname = req.connTLSHostname
 
 	return newReq
 }
