@@ -239,7 +239,10 @@ select {
 ## SECURITY
 
 **CRLF injection**:
-For user input building request or response, use `sip.ValidateRequest` and `sip.ValidateResponse` before passing to transaction or transport.
+When user-controlled values are used to build a request or response, call
+`sip.ValidateRequest` or `sip.ValidateResponse` after constructing its start line
+and headers and before passing it to a transaction or transport. Message bodies
+are not checked because CR and LF are valid body bytes.
 
 ## Client stateless request
 
@@ -410,4 +413,3 @@ go test ./...
 
 This project was influenced by [gosip](https://github.com/ghettovoice/gosip), project by @ghetovoice, but started as new project to achieve best/better performance and to improve API.
 This unfortunately required many design changes, therefore this libraries are not compatible.
-
