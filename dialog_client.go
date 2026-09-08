@@ -24,13 +24,13 @@ type DialogClientSession struct {
 
 func (s *DialogClientSession) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
 	s.setState(sip.DialogStateEnded)
+	defer s.Close()              // Delete our dialog always
+	defer s.inviteTx.Terminate() // Terminates Invite transaction
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	if err := tx.Respond(res); err != nil {
 		return err
 	}
-	defer s.Close()              // Delete our dialog always
-	defer s.inviteTx.Terminate() // Terminates Invite transaction
 
 	// select {
 	// case <-tx.Done():

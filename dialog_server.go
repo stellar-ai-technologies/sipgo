@@ -40,12 +40,10 @@ func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	defer s.inviteTx.Terminate() // Terminat`es Invite transaction
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
-	if err := tx.Respond(res); err != nil {
-		return err
-	}
-
+	err := tx.Respond(res)
+	// A valid remote BYE ends the dialog even if its response cannot be sent.
 	s.setState(sip.DialogStateEnded)
-	return nil
+	return err
 }
 
 // Do does request response pattern. For more control over transaction use TransactionRequest
