@@ -119,6 +119,68 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 	})
 }
 
+func TestServerTransactionReliableFinalResponse(t *testing.T) {
+	for _, transport := range []string{"TCP", "TLS"} {
+		t.Run(transport, func(t *testing.T) {
+			req := testCreateRequest(t, "BYE", "sip:example.com", transport, "127.0.0.1:5060")
+			req.CSeq().MethodName = BYE
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			// Exercise the real zero-delay Timer J against Respond's return path.
+			for i := 0; i < 10000; i++ {
+				var outgoing bytes.Buffer
+				conn := &TCPConnection{Conn: &fakes.TCPConn{Writer: &outgoing}}
+				conn.Ref(1)
+				tx := NewServerTx("bye", req, conn, logger)
+				require.NoError(t, tx.Init())
+				err := tx.Respond(NewResponseFromRequest(req, 200, "OK", nil))
+				require.Contains(t, outgoing.String(), "SIP/2.0 200 OK")
+				select {
+				case <-tx.Done():
+				case <-time.After(time.Second):
+					tx.Terminate()
+					t.Fatal("reliable transaction did not finish")
+				}
+				require.NoError(t, err, "successful response %d must not inherit Timer J cleanup", i)
+				require.ErrorIs(t, tx.Err(), ErrTransactionTerminated)
+			}
+		})
+	}
+}
+
+func TestServerTransactionFinalResponseErrors(t *testing.T) {
+	for _, terminated := range []bool{false, true} {
+		name := "write failure"
+		if terminated {
+			name = "already terminated"
+		}
+		t.Run(name, func(t *testing.T) {
+			r, w := io.Pipe()
+			t.Cleanup(func() { _ = r.Close() })
+			require.NoError(t, w.Close())
+			req := testCreateRequest(t, "BYE", "sip:example.com", "TLS", "127.0.0.1:5060")
+			req.CSeq().MethodName = BYE
+			writer := io.Writer(w)
+			if terminated {
+				writer = io.Discard
+			}
+			conn := &TCPConnection{Conn: &fakes.TCPConn{Writer: writer}}
+			conn.Ref(1)
+			tx := NewServerTx("bye", req, conn, slog.Default())
+			require.NoError(t, tx.Init())
+			t.Cleanup(tx.Terminate)
+			if terminated {
+				tx.Terminate()
+			}
+			err := tx.Respond(NewResponseFromRequest(req, 200, "OK", nil))
+			if terminated {
+				require.ErrorIs(t, err, ErrTransactionTerminated)
+			} else {
+				require.ErrorIs(t, err, ErrTransactionTransport)
+			}
+		})
+	}
+}
+
 func TestServerTransactionFSMInvite(t *testing.T) {
 	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
 
