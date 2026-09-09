@@ -1,18 +1,141 @@
 package sip
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/fakes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTransactionLayerRequestPanic(t *testing.T) {
+	for _, transport := range []string{"UDP", "TCP"} {
+		for _, tc := range []struct {
+			name      string
+			method    RequestMethod
+			status    int
+			terminate bool
+			want      int
+		}{
+			{name: "invite", method: INVITE, want: 500},
+			{name: "provisional", method: INVITE, status: 180, want: 500},
+			{name: "final_error", method: INVITE, status: 486, want: 486},
+			{name: "final_success", method: INVITE, status: 200, want: 200},
+			{name: "options", method: OPTIONS, want: 500},
+			{name: "terminated", method: INVITE, terminate: true},
+			{name: "ack", method: ACK},
+			{name: "cancel", method: CANCEL},
+			{name: "answered_cancel", method: CANCEL, status: 200, want: 200},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				var output, diagnostics panicTestBuffer
+				logger := slog.New(slog.NewTextHandler(&diagnostics, &slog.HandlerOptions{Level: slog.LevelError}))
+				tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+				defer tp.Close()
+				txl := NewTransactionLayer(tp, WithTransactionLayerLogger(logger))
+				defer txl.Close()
+				const peer = "127.0.0.1:5061"
+				conn := &TCPConnection{Conn: &fakes.TCPConn{Writer: &output}}
+				pool := tp.tcp.pool
+				if transport == "UDP" {
+					pool = tp.udp.pool
+				}
+				pool.Add(peer, conn)
+				req := testCreateRequest(t, string(tc.method), "sip:secret@example.com", transport, peer)
+				req.CSeq().MethodName = tc.method
+				req.SetSource(peer)
+				req.SetBody([]byte("secret-sdp-key"))
+				var handled *ServerTx
+				txl.OnRequest(func(req *Request, tx *ServerTx) {
+					handled = tx
+					if tc.status != 0 {
+						require.NoError(t, tx.Respond(NewResponseFromRequest(req, tc.status, "Test response", nil)))
+					}
+					if tc.terminate {
+						tx.Terminate()
+					}
+					panic("secret-panic-value")
+				})
+				// The same entry point handleMessage launches for transport requests.
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					txl.handleRequestBackground(req)
+				}()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("panicking handler did not finish")
+				}
+				require.NotNil(t, handled)
+				require.Contains(t, diagnostics.String(), "SIP request handler panic")
+				require.NotContains(t, diagnostics.String(), "secret")
+				if tc.want == 0 {
+					require.Empty(t, output.String())
+				} else {
+					require.Contains(t, output.String(), "SIP/2.0 "+strconv.Itoa(tc.want))
+					if tc.want != 500 {
+						require.NotContains(t, output.String(), "SIP/2.0 500")
+					}
+				}
+				if transport == "UDP" && (tc.method == INVITE || tc.method == OPTIONS) && !tc.terminate {
+					handled.fsmMu.Lock()
+					cachedStatus := handled.fsmResp.StatusCode
+					handled.fsmMu.Unlock()
+					require.Equal(t, tc.want, cachedStatus, "final response cache must survive recovery")
+					if tc.want >= 300 {
+						before := len(output.String())
+						require.NoError(t, handled.Receive(req))
+						require.Contains(t, output.String()[before:], "SIP/2.0 "+strconv.Itoa(tc.want))
+					}
+				} else {
+					select {
+					case <-handled.Done():
+					default:
+						t.Fatal("recovered transaction leaked")
+					}
+				}
+				// An independent transaction still reaches the handler and responds.
+				txl.OnRequest(func(req *Request, tx *ServerTx) {
+					require.NoError(t, tx.Respond(NewResponseFromRequest(req, StatusOK, "OK", nil)))
+					tx.TerminateGracefully()
+				})
+				control := testCreateRequest(t, "OPTIONS", "sip:control@example.com", transport, peer)
+				control.CSeq().MethodName = OPTIONS
+				control.SetSource(peer)
+				txl.handleRequestBackground(control)
+				require.Contains(t, output.String(), "SIP/2.0 200 OK")
+			})
+		}
+	}
+}
+
+type panicTestBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *panicTestBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *panicTestBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func testCreateAddr(t *testing.T, addr string) Addr {
 	a := Addr{}

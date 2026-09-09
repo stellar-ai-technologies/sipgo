@@ -125,6 +125,36 @@ func (tx *ServerTx) Respond(res *Response) error {
 	return tx.spinFsmWithResponse(input, res)
 }
 
+// respondInternalError sends a panic fallback without replacing a final response
+// retained for retransmission. The check and FSM update must be atomic.
+func (tx *ServerTx) respondInternalError() error {
+	// ACK has no response; CANCEL responses bypass the FSM, so its response
+	// history cannot safely tell us whether a final response was already sent.
+	if tx.origin.IsAck() || tx.origin.IsCancel() {
+		return nil
+	}
+	tx.mu.Lock()
+	if tx.timer_1xx != nil {
+		tx.timer_1xx.Stop()
+		tx.timer_1xx = nil
+	}
+	tx.mu.Unlock()
+
+	tx.fsmMu.Lock()
+	defer tx.fsmMu.Unlock()
+	select {
+	case <-tx.done:
+		return nil
+	default:
+	}
+	if tx.fsmResp != nil && !tx.fsmResp.IsProvisional() {
+		return nil
+	}
+	tx.fsmResp = NewResponseFromRequest(tx.origin, StatusInternalServerError, "Internal Server Error", nil)
+	tx.spinFsmUnsafe(server_input_user_300_plus)
+	return tx.fsmErr
+}
+
 // Acks makes channel for sending acks. Channel is created on demand
 func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks

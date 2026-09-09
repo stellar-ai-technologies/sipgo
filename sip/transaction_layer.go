@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 )
 
@@ -276,8 +277,22 @@ func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {
 	txl.serverTransactions.unlock()
 
 	// pass request and transaction to handler
+	defer txl.recoverRequest(tx)
 	txl.reqHandler(req, tx)
 	return nil
+}
+
+// recoverRequest contains handler panics after the transaction-store lock is
+// released, before middleware or dialog parsing runs.
+func (txl *TransactionLayer) recoverRequest(tx *ServerTx) {
+	if recovered := recover(); recovered != nil {
+		// Panic values can contain credentials or SDP keys; log only their type.
+		txl.log.Error("SIP request handler panic", "panic_type", fmt.Sprintf("%T", recovered), "stack", string(debug.Stack()))
+		defer tx.TerminateGracefully()
+		if err := tx.respondInternalError(); err != nil {
+			txl.log.Error("Failed to send request handler failure response")
+		}
+	}
 }
 
 func (txl *TransactionLayer) serverTxCreate(req *Request, key string) (*ServerTx, error) {
