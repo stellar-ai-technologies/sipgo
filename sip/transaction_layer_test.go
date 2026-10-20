@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -301,4 +302,134 @@ func TestTransactionLayerClientTx(t *testing.T) {
 	require.EqualValues(t, 1, atomic.LoadInt32(&count))
 	require.Equal(t, 2, tp.udp.pool.Size())
 	assert.True(t, tp.udp.pool.Get("127.0.0.1:9876") != nil)
+}
+
+// blockTCPDial makes TCP dials wait until release is called, so a test can hold
+// a server transaction's connection acquisition open. Each dial reports itself
+// on the returned channel before it blocks.
+func blockTCPDial(t *testing.T, tp *TransportLayer) (dialing <-chan struct{}, release func()) {
+	ch := make(chan struct{}, 1)
+	released := make(chan struct{})
+	tp.tcp.DialerCreate = func(laddr net.Addr) net.Dialer {
+		return net.Dialer{ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error {
+			ch <- struct{}{}
+			select {
+			case <-released:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}}
+	}
+	release = sync.OnceFunc(func() { close(released) })
+	t.Cleanup(release)
+	return ch, release
+}
+
+// listenTCP accepts connections on a loopback port and passes them to the test.
+func listenTCP(t *testing.T) (net.Listener, <-chan net.Conn) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+			accepted <- c
+		}
+	}()
+	return ln, accepted
+}
+
+func receiveWithin[T any](t *testing.T, ch <-chan T, msg string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatal(msg)
+		var zero T
+		return zero
+	}
+}
+
+// A request whose reliable-transport connection is gone makes the server
+// transaction dial back to the Via address. That dial must not hold the
+// transaction store lock, or one unreachable sender stalls every other request.
+func TestTransactionLayerServerTxDialDoesNotBlockOtherRequests(t *testing.T) {
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	defer tp.Close()
+	txl := NewTransactionLayer(tp)
+	defer txl.Close()
+	dialing, release := blockTCPDial(t, tp)
+	ln, _ := listenTCP(t)
+
+	handled := make(chan RequestMethod, 2)
+	txl.OnRequest(func(req *Request, tx *ServerTx) {
+		handled <- req.Method
+	})
+
+	invite := testCreateRequest(t, "INVITE", "sip:bob@127.0.0.1", "TCP", ln.Addr().String())
+	invite.SetSource("127.0.0.1:5070")
+	go txl.handleRequestBackground(invite)
+	receiveWithin(t, dialing, "INVITE did not dial back")
+
+	const peer = "127.0.0.1:5061"
+	tp.udp.pool.Add(peer, &TCPConnection{Conn: &fakes.TCPConn{Writer: &panicTestBuffer{}}})
+	options := testCreateRequest(t, "OPTIONS", "sip:bob@example.com", "UDP", peer)
+	options.CSeq().MethodName = OPTIONS
+	options.SetSource(peer)
+	go txl.handleRequestBackground(options)
+	require.Equal(t, OPTIONS, receiveWithin(t, handled, "OPTIONS waited for the INVITE dial-back"))
+
+	release()
+	require.Equal(t, INVITE, receiveWithin(t, handled, "INVITE not handled after its dial-back"))
+}
+
+// A retransmission can create the transaction while the original request is
+// still acquiring its connection. The original must then join that transaction
+// instead of creating a duplicate, and release the connection it acquired.
+func TestTransactionLayerServerTxDialRace(t *testing.T) {
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	defer tp.Close()
+	txl := NewTransactionLayer(tp)
+	defer txl.Close()
+	dialing, release := blockTCPDial(t, tp)
+	ln, accepted := listenTCP(t)
+
+	var handled atomic.Int32
+	txl.OnRequest(func(req *Request, tx *ServerTx) {
+		handled.Add(1)
+	})
+
+	invite := testCreateRequest(t, "INVITE", "sip:bob@127.0.0.1", "TCP", ln.Addr().String())
+	invite.SetSource("127.0.0.1:5070")
+	done := make(chan error, 1)
+	go func() { done <- txl.handleRequest(invite) }()
+	receiveWithin(t, dialing, "INVITE did not dial back")
+
+	// The retransmission arrives over a connection that is still open.
+	const peer = "127.0.0.1:5071"
+	tp.tcp.pool.Add(peer, &TCPConnection{Conn: &fakes.TCPConn{Writer: &panicTestBuffer{}}})
+	retransmission := invite.Clone()
+	retransmission.SetSource(peer)
+	require.NoError(t, txl.handleRequest(retransmission))
+	require.EqualValues(t, 1, handled.Load())
+
+	release()
+	require.NoError(t, receiveWithin(t, done, "INVITE did not finish after its dial-back"))
+	require.EqualValues(t, 1, handled.Load(), "duplicate server transaction created")
+
+	key, err := makeServerTxKey(invite, "")
+	require.NoError(t, err)
+	tx, ok := txl.getServerTx(key)
+	require.True(t, ok)
+	dialed := tp.tcp.pool.getUnref(receiveWithin(t, accepted, "dial-back not accepted").RemoteAddr().String())
+	require.NotNil(t, dialed)
+	require.NotSame(t, tx.conn, dialed)
+	require.Equal(t, 1+TransportIdleConnection, dialed.Ref(0), "discarded connection reference not released")
 }
