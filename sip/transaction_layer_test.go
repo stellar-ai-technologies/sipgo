@@ -330,16 +330,28 @@ func blockTCPDial(t *testing.T, tp *TransportLayer) (dialing <-chan struct{}, re
 func listenTCP(t *testing.T) (net.Listener, <-chan net.Conn) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	t.Cleanup(func() { ln.Close() })
 	accepted := make(chan net.Conn, 2)
+	done := make(chan struct{})
+	var conns []net.Conn
+	t.Cleanup(func() {
+		ln.Close()
+		<-done
+		for _, c := range conns {
+			c.Close()
+		}
+	})
 	go func() {
+		defer close(done)
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			t.Cleanup(func() { c.Close() })
-			accepted <- c
+			conns = append(conns, c)
+			select {
+			case accepted <- c:
+			default:
+			}
 		}
 	}()
 	return ln, accepted
